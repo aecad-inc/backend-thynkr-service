@@ -30,10 +30,12 @@ class Settings(BaseSettings):
     CHROMA_PORT: int = int(os.getenv("CHROMA_PORT", "8000"))
     CHROMA_COLLECTION_NAME: str = os.getenv("CHROMA_COLLECTION_NAME", "aecad_context")
     
-    # Redis Configuration
+    # Redis Configuration (Updated for aioredis)
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379")
     REDIS_PASSWORD: Optional[str] = os.getenv("REDIS_PASSWORD")
     REDIS_DB: int = int(os.getenv("REDIS_DB", "0"))
+    REDIS_MAX_CONNECTIONS: int = int(os.getenv("REDIS_MAX_CONNECTIONS", "20"))
+    REDIS_RETRY_ON_TIMEOUT: bool = os.getenv("REDIS_RETRY_ON_TIMEOUT", "true").lower() == "true"
     
     # Context Management
     SESSION_TIMEOUT: int = int(os.getenv("SESSION_TIMEOUT", "3600"))  # 1 hour

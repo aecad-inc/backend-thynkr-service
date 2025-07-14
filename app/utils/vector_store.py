@@ -1,7 +1,8 @@
 import logging
 import chromadb
 from chromadb.config import Settings
-from typing import Dict, List, Any, Optional
+from chromadb.api.types import Include, IncludeEnum, Where
+from typing import Dict, List, Any, Optional, Union, cast
 import json
 from app.config.settings import settings
 
@@ -46,20 +47,23 @@ class VectorStore:
     ):
         """Store context data with embeddings"""
         try:
+            if not self.collection:
+                raise RuntimeError("Vector store not initialized")
+                
             # Create text representation for embedding
             text_content = self._create_searchable_text(context_data, context_type)
             
-            # Prepare metadata
+            # Prepare metadata - ChromaDB requires string values
             metadata = {
-                "context_type": context_type,
-                "stored_at": context_data.get("stored_at", ""),
-                "file_id": context_data.get("file_id", ""),
-                "project_id": context_data.get("project_id", ""),
-                "user_id": context_data.get("user_id", "")
+                "context_type": str(context_type),
+                "stored_at": str(context_data.get("stored_at", "")),
+                "file_id": str(context_data.get("file_id", "")),
+                "project_id": str(context_data.get("project_id", "")),
+                "user_id": str(context_data.get("user_id", ""))
             }
             
-            # Remove None values from metadata
-            metadata = {k: v for k, v in metadata.items() if v is not None and v != ""}
+            # Remove empty values from metadata
+            metadata = {k: v for k, v in metadata.items() if v and v.strip() and v != "None"}
             
             # Store in ChromaDB
             self.collection.add(
@@ -70,9 +74,11 @@ class VectorStore:
             
             # Also store full context data as JSON in a separate document
             full_context_id = f"{context_id}_full"
+            full_metadata = {**metadata, "is_full_context": "true"}
+            
             self.collection.add(
                 documents=[json.dumps(context_data, default=str)],
-                metadatas=[{**metadata, "is_full_context": True}],
+                metadatas=[full_metadata],
                 ids=[full_context_id]
             )
             
@@ -85,19 +91,30 @@ class VectorStore:
     async def get_context(self, context_id: str) -> Optional[Dict[str, Any]]:
         """Retrieve context by ID"""
         try:
+            if not self.collection:
+                raise RuntimeError("Vector store not initialized")
+                
             full_context_id = f"{context_id}_full"
             
-            # Query for full context
+            # Query for full context using proper include types
             results = self.collection.get(
                 ids=[full_context_id],
-                include=["documents", "metadatas"]
+                include=[IncludeEnum.documents, IncludeEnum.metadatas]
             )
             
-            if results["documents"]:
-                context_json = results["documents"][0]
-                return json.loads(context_json)
-            
-            return None
+            # Check if results and documents exist
+            if not results or "documents" not in results:
+                return None
+                
+            documents = results["documents"]
+            if not documents or len(documents) == 0:
+                return None
+                
+            context_json = documents[0]
+            if not context_json:
+                return None
+                
+            return json.loads(context_json)
             
         except Exception as e:
             logger.error(f"Failed to retrieve context {context_id}: {e}")
@@ -110,19 +127,23 @@ class VectorStore:
     ):
         """Store enhancement or learning pattern"""
         try:
+            if not self.collection:
+                raise RuntimeError("Vector store not initialized")
+                
             # Create searchable text for the pattern
             text_content = self._create_pattern_text(pattern_data)
             
+            # Prepare metadata - ensure all values are strings
             metadata = {
-                "pattern_type": pattern_data.get("pattern_type", "unknown"),
-                "layer_name": pattern_data.get("layer_name", ""),
-                "model": pattern_data.get("model", ""),
-                "confidence_improvement": pattern_data.get("confidence_improvement", 0.0),
-                "stored_at": pattern_data.get("stored_at", "")
+                "pattern_type": str(pattern_data.get("pattern_type", "unknown")),
+                "layer_name": str(pattern_data.get("layer_name", "")),
+                "model": str(pattern_data.get("model", "")),
+                "confidence_improvement": str(pattern_data.get("confidence_improvement", 0.0)),
+                "stored_at": str(pattern_data.get("stored_at", ""))
             }
             
-            # Clean metadata
-            metadata = {k: v for k, v in metadata.items() if v is not None and v != ""}
+            # Clean metadata - only keep non-empty values
+            metadata = {k: v for k, v in metadata.items() if v and v.strip() and v != "None"}
             
             # Store pattern
             self.collection.add(
@@ -133,9 +154,11 @@ class VectorStore:
             
             # Store full pattern data
             full_pattern_id = f"{pattern_id}_full"
+            full_metadata = {**metadata, "is_full_pattern": "true"}
+            
             self.collection.add(
                 documents=[json.dumps(pattern_data, default=str)],
-                metadatas=[{**metadata, "is_full_pattern": True}],
+                metadatas=[full_metadata],
                 ids=[full_pattern_id]
             )
             
@@ -153,46 +176,98 @@ class VectorStore:
     ) -> List[Dict[str, Any]]:
         """Find similar patterns using semantic search"""
         try:
-            # Build where clause for filtering
-            where_clause = {}
+            if not self.collection:
+                raise RuntimeError("Vector store not initialized")
+                
+            # Build where clause for filtering with proper typing
+            where_clause: Optional[Where] = None
             if pattern_type:
-                where_clause["pattern_type"] = pattern_type
+                where_clause = cast(Where, {"pattern_type": pattern_type})
             
             # Perform similarity search
             results = self.collection.query(
                 query_texts=[query_text],
-                n_results=limit * 2,  # Get more results to filter
-                where=where_clause if where_clause else None,
-                include=["documents", "metadatas", "distances"]
+                n_results=min(limit * 2, 100),  # Get more results to filter, but cap at 100
+                where=where_clause,
+                include=[IncludeEnum.documents, IncludeEnum.metadatas, IncludeEnum.distances]
             )
+            
+            # Validate results structure
+            if not results:
+                logger.warning("No query results returned")
+                return []
+            
+            # Check required keys exist
+            required_keys = ["documents", "metadatas", "distances", "ids"]
+            if not all(key in results for key in required_keys):
+                logger.warning(f"Missing required keys in results: {results.keys()}")
+                return []
+            
+            # Extract result arrays with proper null checking
+            documents = results.get("documents")
+            metadatas = results.get("metadatas")
+            distances = results.get("distances")
+            ids = results.get("ids")
+            
+            # Validate all arrays exist and have content
+            if not all([documents, metadatas, distances, ids]):
+                logger.warning("One or more result arrays are empty or None")
+                return []
+            
+            # Check if nested arrays exist and are not empty
+            if (not documents or not documents[0] or 
+                not metadatas or not metadatas[0] or
+                not distances or not distances[0] or 
+                not ids or not ids[0]):
+                logger.warning("One or more nested result arrays are empty")
+                return []
             
             patterns = []
             seen_base_ids = set()
             
-            # Process results and get full pattern data
-            for i, (doc, metadata, distance) in enumerate(zip(
-                results["documents"][0],
-                results["metadatas"][0], 
-                results["distances"][0]
-            )):
-                # Skip full context documents in similarity search
-                if metadata.get("is_full_pattern"):
+            # Process results safely with type guards
+            if not (documents and len(documents) > 0 and documents[0] and
+                    metadatas and len(metadatas) > 0 and metadatas[0] and
+                    distances and len(distances) > 0 and distances[0] and
+                    ids and len(ids) > 0 and ids[0]):
+                return []
+                
+            doc_list = documents[0]
+            meta_list = metadatas[0]
+            dist_list = distances[0]
+            id_list = ids[0]
+            
+            # Ensure all lists have the same length
+            min_length = min(len(doc_list), len(meta_list), len(dist_list), len(id_list))
+            
+            for i in range(min_length):
+                try:
+                    doc = doc_list[i]
+                    metadata = meta_list[i]
+                    distance = dist_list[i]
+                    pattern_id = id_list[i]
+                    
+                    # Skip full pattern documents in similarity search
+                    if metadata and metadata.get("is_full_pattern") == "true":
+                        continue
+                    
+                    # Skip duplicates
+                    if pattern_id in seen_base_ids:
+                        continue
+                    seen_base_ids.add(pattern_id)
+                    
+                    # Get full pattern data
+                    full_pattern = await self.get_pattern(pattern_id)
+                    if full_pattern:
+                        full_pattern["similarity_score"] = max(0.0, 1.0 - distance)  # Ensure non-negative
+                        patterns.append(full_pattern)
+                    
+                    if len(patterns) >= limit:
+                        break
+                        
+                except (IndexError, TypeError, KeyError) as e:
+                    logger.warning(f"Error processing result {i}: {e}")
                     continue
-                
-                # Extract base pattern ID
-                pattern_id = results["ids"][0][i]
-                if pattern_id in seen_base_ids:
-                    continue
-                seen_base_ids.add(pattern_id)
-                
-                # Get full pattern data
-                full_pattern = await self.get_pattern(pattern_id)
-                if full_pattern:
-                    full_pattern["similarity_score"] = 1.0 - distance  # Convert distance to similarity
-                    patterns.append(full_pattern)
-                
-                if len(patterns) >= limit:
-                    break
             
             return patterns
             
@@ -203,16 +278,24 @@ class VectorStore:
     async def get_pattern(self, pattern_id: str) -> Optional[Dict[str, Any]]:
         """Get full pattern data by ID"""
         try:
+            if not self.collection:
+                raise RuntimeError("Vector store not initialized")
+                
             full_pattern_id = f"{pattern_id}_full"
             
             results = self.collection.get(
                 ids=[full_pattern_id],
-                include=["documents"]
+                include=[IncludeEnum.documents]
             )
             
-            if results["documents"]:
+            if (results and 
+                "documents" in results and 
+                results["documents"] and 
+                len(results["documents"]) > 0):
+                
                 pattern_json = results["documents"][0]
-                return json.loads(pattern_json)
+                if pattern_json:
+                    return json.loads(pattern_json)
             
             return None
             
@@ -228,50 +311,100 @@ class VectorStore:
     ) -> List[Dict[str, Any]]:
         """Perform semantic search across all stored contexts"""
         try:
-            # Build where clause
-            where_clause = {}
+            if not self.collection:
+                raise RuntimeError("Vector store not initialized")
+                
+            # Build where clause with proper typing
+            where_clause: Optional[Where] = None
             if context_types:
-                where_clause["context_type"] = {"$in": context_types}
+                where_clause = cast(Where, {"context_type": {"$in": context_types}})
             
             # Perform search
             results = self.collection.query(
                 query_texts=[query],
-                n_results=limit * 2,
-                where=where_clause if where_clause else None,
-                include=["documents", "metadatas", "distances"]
+                n_results=min(limit * 2, 100),  # Cap at 100 results
+                where=where_clause,
+                include=[IncludeEnum.documents, IncludeEnum.metadatas, IncludeEnum.distances]
             )
+            
+            # Validate results structure
+            if not results:
+                return []
+                
+            required_keys = ["documents", "metadatas", "distances", "ids"]
+            if not all(key in results for key in required_keys):
+                logger.warning(f"Missing required keys in search results: {results.keys()}")
+                return []
+                
+            # Extract result arrays with proper null checking
+            documents = results.get("documents")
+            metadatas = results.get("metadatas")
+            distances = results.get("distances")
+            ids = results.get("ids")
+            
+            # Validate arrays exist and are not None
+            if not all([documents, metadatas, distances, ids]):
+                return []
+            
+            # Check if nested arrays exist and are not empty
+            if (not documents or not documents[0] or 
+                not metadatas or not metadatas[0] or
+                not distances or not distances[0] or 
+                not ids or not ids[0]):
+                return []
             
             search_results = []
             seen_base_ids = set()
             
-            for i, (doc, metadata, distance) in enumerate(zip(
-                results["documents"][0],
-                results["metadatas"][0],
-                results["distances"][0]
-            )):
-                # Skip full context documents in search results
-                if metadata.get("is_full_context") or metadata.get("is_full_pattern"):
+            # Process results safely with type guards
+            if not (documents and len(documents) > 0 and documents[0] and
+                    metadatas and len(metadatas) > 0 and metadatas[0] and
+                    distances and len(distances) > 0 and distances[0] and
+                    ids and len(ids) > 0 and ids[0]):
+                return []
+                
+            doc_list = documents[0]
+            meta_list = metadatas[0]
+            dist_list = distances[0]
+            id_list = ids[0]
+            
+            min_length = min(len(doc_list), len(meta_list), len(dist_list), len(id_list))
+            
+            for i in range(min_length):
+                try:
+                    doc = doc_list[i]
+                    metadata = meta_list[i]
+                    distance = dist_list[i]
+                    context_id = id_list[i]
+                    
+                    # Skip full context documents in search results
+                    if (metadata and 
+                        (metadata.get("is_full_context") == "true" or 
+                         metadata.get("is_full_pattern") == "true")):
+                        continue
+                    
+                    if context_id in seen_base_ids:
+                        continue
+                    seen_base_ids.add(context_id)
+                    
+                    # Get full context
+                    full_context = await self.get_context(context_id)
+                    if full_context:
+                        search_result = {
+                            "context_id": context_id,
+                            "similarity_score": max(0.0, 1.0 - distance),  # Ensure non-negative
+                            "context_type": metadata.get("context_type") if metadata else None,
+                            "preview": doc[:200] + "..." if len(doc) > 200 else doc,
+                            "full_context": full_context
+                        }
+                        search_results.append(search_result)
+                    
+                    if len(search_results) >= limit:
+                        break
+                        
+                except (IndexError, TypeError, KeyError) as e:
+                    logger.warning(f"Error processing search result {i}: {e}")
                     continue
-                
-                context_id = results["ids"][0][i]
-                if context_id in seen_base_ids:
-                    continue
-                seen_base_ids.add(context_id)
-                
-                # Get full context
-                full_context = await self.get_context(context_id)
-                if full_context:
-                    search_result = {
-                        "context_id": context_id,
-                        "similarity_score": 1.0 - distance,
-                        "context_type": metadata.get("context_type"),
-                        "preview": doc[:200] + "..." if len(doc) > 200 else doc,
-                        "full_context": full_context
-                    }
-                    search_results.append(search_result)
-                
-                if len(search_results) >= limit:
-                    break
             
             return search_results
             
@@ -282,25 +415,39 @@ class VectorStore:
     async def get_context_statistics(self) -> Dict[str, Any]:
         """Get statistics about stored contexts"""
         try:
+            if not self.collection:
+                raise RuntimeError("Vector store not initialized")
+                
             # Get collection info
             collection_count = self.collection.count()
             
             # Get breakdown by context type
-            all_metadata = self.collection.get(include=["metadatas"])["metadatas"]
+            try:
+                all_results = self.collection.get(include=[IncludeEnum.metadatas])
+                all_metadata = all_results.get("metadatas") if all_results else None
+            except Exception as e:
+                logger.warning(f"Failed to get all metadata: {e}")
+                all_metadata = None
             
             context_type_counts = {}
             pattern_type_counts = {}
             
-            for metadata in all_metadata:
-                if metadata.get("is_full_context") or metadata.get("is_full_pattern"):
-                    continue  # Skip full documents
-                
-                context_type = metadata.get("context_type", "unknown")
-                context_type_counts[context_type] = context_type_counts.get(context_type, 0) + 1
-                
-                if context_type == "enhancement":
-                    pattern_type = metadata.get("pattern_type", "unknown")
-                    pattern_type_counts[pattern_type] = pattern_type_counts.get(pattern_type, 0) + 1
+            if all_metadata:
+                for metadata in all_metadata:
+                    if not metadata:
+                        continue
+                        
+                    # Skip full documents in statistics
+                    if (metadata.get("is_full_context") == "true" or 
+                        metadata.get("is_full_pattern") == "true"):
+                        continue
+                    
+                    context_type = metadata.get("context_type", "unknown")
+                    context_type_counts[context_type] = context_type_counts.get(context_type, 0) + 1
+                    
+                    if context_type == "enhancement":
+                        pattern_type = metadata.get("pattern_type", "unknown")
+                        pattern_type_counts[pattern_type] = pattern_type_counts.get(pattern_type, 0) + 1
             
             return {
                 "total_documents": collection_count,
@@ -311,7 +458,13 @@ class VectorStore:
             
         except Exception as e:
             logger.error(f"Failed to get context statistics: {e}")
-            return {}
+            return {
+                "total_documents": 0,
+                "context_type_breakdown": {},
+                "pattern_type_breakdown": {},
+                "collection_name": settings.CHROMA_COLLECTION_NAME,
+                "error": str(e)
+            }
     
     def _create_searchable_text(self, context_data: Dict[str, Any], context_type: str) -> str:
         """Create searchable text from context data"""
@@ -323,41 +476,55 @@ class VectorStore:
             
             # Add key fields based on context type
             if context_type == "file":
-                if "file_name" in context_data:
+                if "file_name" in context_data and context_data["file_name"]:
                     text_parts.append(f"File: {context_data['file_name']}")
                 if "project_context" in context_data:
                     project_ctx = context_data["project_context"]
                     if isinstance(project_ctx, dict):
-                        if "project_type" in project_ctx:
+                        if project_ctx.get("project_type"):
                             text_parts.append(f"Project type: {project_ctx['project_type']}")
-                        if "project_description" in project_ctx:
+                        if project_ctx.get("project_description"):
                             text_parts.append(f"Description: {project_ctx['project_description']}")
             
             elif context_type == "feedback":
-                text_parts.extend([
-                    f"Layer: {context_data.get('layer_name', '')}",
-                    f"Original: {context_data.get('original_prediction', '')}",
-                    f"Correction: {context_data.get('user_correction', '')}",
-                    f"Comments: {context_data.get('comments', '')}"
-                ])
+                feedback_parts = []
+                if context_data.get('layer_name'):
+                    feedback_parts.append(f"Layer: {context_data['layer_name']}")
+                if context_data.get('original_prediction'):
+                    feedback_parts.append(f"Original: {context_data['original_prediction']}")
+                if context_data.get('user_correction'):
+                    feedback_parts.append(f"Correction: {context_data['user_correction']}")
+                if context_data.get('comments'):
+                    feedback_parts.append(f"Comments: {context_data['comments']}")
+                text_parts.extend(feedback_parts)
             
             elif context_type == "session":
                 if "conversation_history" in context_data:
                     history = context_data["conversation_history"]
                     if isinstance(history, list) and history:
-                        recent_queries = [h.get("user_query", "") for h in history[-3:]]
-                        text_parts.append(f"Recent queries: {' '.join(recent_queries)}")
+                        recent_queries = []
+                        for h in history[-3:]:  # Last 3 interactions
+                            if isinstance(h, dict) and h.get("user_query"):
+                                recent_queries.append(h["user_query"])
+                        if recent_queries:
+                            text_parts.append(f"Recent queries: {' '.join(recent_queries)}")
             
             # Add any additional text content
             for key in ["content", "description", "notes", "reasoning"]:
                 if key in context_data and context_data[key]:
                     text_parts.append(str(context_data[key]))
             
-            return " | ".join(filter(None, text_parts))
+            result = " | ".join(filter(None, text_parts))
+            return result if result else "No searchable content"
             
         except Exception as e:
             logger.warning(f"Failed to create searchable text: {e}")
-            return json.dumps(context_data, default=str)[:500]  # Fallback
+            # Safe fallback
+            try:
+                fallback = json.dumps(context_data, default=str)[:500]
+                return fallback if fallback else "No content available"
+            except Exception:
+                return "No content available"
     
     def _create_pattern_text(self, pattern_data: Dict[str, Any]) -> str:
         """Create searchable text for patterns"""
@@ -369,45 +536,57 @@ class VectorStore:
             text_parts.append(f"Pattern: {pattern_type}")
             
             # Add layer information
-            if "layer_name" in pattern_data:
+            if pattern_data.get("layer_name"):
                 text_parts.append(f"Layer: {pattern_data['layer_name']}")
             
             # Add prediction information
             if "original_predictions" in pattern_data:
                 predictions = pattern_data["original_predictions"]
-                if isinstance(predictions, list):
-                    pred_text = ", ".join([
-                        f"{p.get('model', '')}: {p.get('prediction', '')}"
-                        for p in predictions
-                    ])
-                    text_parts.append(f"Original predictions: {pred_text}")
+                if isinstance(predictions, list) and predictions:
+                    pred_parts = []
+                    for p in predictions:
+                        if isinstance(p, dict):
+                            model = p.get('model', '')
+                            prediction = p.get('prediction', '')
+                            if model and prediction:
+                                pred_parts.append(f"{model}: {prediction}")
+                    if pred_parts:
+                        text_parts.append(f"Original predictions: {', '.join(pred_parts)}")
             
             # Add enhanced prediction
-            if "enhanced_prediction" in pattern_data:
+            if pattern_data.get("enhanced_prediction"):
                 text_parts.append(f"Enhanced: {pattern_data['enhanced_prediction']}")
             
             # Add reasoning
             if "reasoning" in pattern_data:
                 reasoning = pattern_data["reasoning"]
-                if isinstance(reasoning, list):
-                    text_parts.append(f"Reasoning: {' '.join(reasoning)}")
-                elif isinstance(reasoning, str):
+                if isinstance(reasoning, list) and reasoning:
+                    text_parts.append(f"Reasoning: {' '.join(str(r) for r in reasoning)}")
+                elif isinstance(reasoning, str) and reasoning:
                     text_parts.append(f"Reasoning: {reasoning}")
             
             # Add context factors
             if "context_factors" in pattern_data:
                 factors = pattern_data["context_factors"]
                 if isinstance(factors, dict):
-                    factor_text = ", ".join([
-                        f"{k}: {v}" for k, v in factors.items() if v
-                    ])
-                    text_parts.append(f"Context: {factor_text}")
+                    factor_parts = []
+                    for k, v in factors.items():
+                        if v:
+                            factor_parts.append(f"{k}: {v}")
+                    if factor_parts:
+                        text_parts.append(f"Context: {', '.join(factor_parts)}")
             
-            return " | ".join(filter(None, text_parts))
+            result = " | ".join(filter(None, text_parts))
+            return result if result else "No pattern content"
             
         except Exception as e:
             logger.warning(f"Failed to create pattern text: {e}")
-            return json.dumps(pattern_data, default=str)[:500]  # Fallback
+            # Safe fallback
+            try:
+                fallback = json.dumps(pattern_data, default=str)[:500]
+                return fallback if fallback else "No content available"
+            except Exception:
+                return "No content available"
     
     async def cleanup(self):
         """Cleanup vector store resources"""

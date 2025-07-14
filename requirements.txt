@@ -7,6 +7,7 @@ langchain
 langchain-aws
 langchain-community
 chromadb
+aioredis>=2.0.0
 redis
 httpx
 numpy
