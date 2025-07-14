@@ -1,0 +1,122 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-thynkr-service
+  namespace: prod
+  labels:
+    app: backend-thynkr-service
+    version: v1
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: backend-thynkr-service
+  template:
+    metadata:
+      labels:
+        app: backend-thynkr-service
+        version: v1
+    spec:
+      serviceAccountName: prod-backend-sa
+      nodeSelector:
+        kubernetes.io/os: linux
+      containers:
+      - name: backend-thynkr-service
+        image: 463470982305.dkr.ecr.us-east-1.amazonaws.com/aecad/backendthynkrservice:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+          name: http
+        
+        # Environment variables from ConfigMap
+        envFrom:
+        - configMapRef:
+            name: backend-thynkr-config
+        
+        # Sensitive environment variables from Secrets
+        env:
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: aecad-thynkr-secrets
+              key: AWS_ACCESS_KEY_ID
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: aecad-thynkr-secrets
+              key: AWS_SECRET_ACCESS_KEY
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: aecad-thynkr-secrets
+              key: REDIS_URL
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: aecad-thynkr-secrets
+              key: REDIS_PASSWORD
+        
+        # Resource limits and requests
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        
+        # Health checks
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+        
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        
+        # Security context
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          runAsUser: 1000
+          readOnlyRootFilesystem: false
+          capabilities:
+            drop:
+            - ALL
+        
+        # Volume mounts for secrets
+        volumeMounts:
+        - name: secrets-store
+          mountPath: "/mnt/secrets"
+          readOnly: true
+      
+      # Volumes
+      volumes:
+      - name: secrets-store
+        csi:
+          driver: secrets-store.csi.k8s.io
+          readOnly: true
+          volumeAttributes:
+            secretProviderClass: aws-secrets-thynkr
+      
+      # Pod security context
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      
+      # Restart policy
+      restartPolicy: Always
+      
+      # Termination grace period
+      terminationGracePeriodSeconds: 30
